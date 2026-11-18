@@ -1,0 +1,64 @@
+{
+  "files": 471,
+  "workers": 1,
+  "scan_seconds": 118.7,
+  "total_seconds": 123.2,
+  "mean_file_seconds": 0.25,
+  "sampled_records": 25953,
+  "unique_patents": 25182,
+  "duplicate_doc_numbers": 753,
+  "duplicates_with_differing_content": 168,
+  "stats": {
+    "no_id": 0,
+    "no_text": 0,
+    "dup": 771,
+    "missing_cls": 9966,
+    "missing_fields": 10241,
+    "bad_record": 0,
+    "bad_file": 0
+  },
+  "top_cpc4": [
+    [
+      "(none)",
+      9656
+    ],
+    [
+      "G06F",
+      1324
+    ],
+    [
+      "H01L",
+      856
+    ],
+    [
+      "H04L",
+      673
+    ],
+    [
+      "A61K",
+      542
+    ],
+    [
+      "H04W",
+      524
+    ],
+    [
+      "A61B",
+      502
+    ],
+    [
+      "H04N",
+      417
+    ],
+    [
+      "G06Q",
+      404
+    ],
+    [
+      "G01N",
+      260
+    ]
+  ],
+  "passages_if_all_paras": 3396007,
+  "passages_if_10_paras": 764817
+}

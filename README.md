@@ -13,6 +13,7 @@ So this project builds:
 1. **Part 1 – hybrid passage-level search engine.** The input is a natural-language query, a claim, or a patent number (patent → similar patents). The output is ranked patents, each with the best-matching claim or paragraph as the "why it matched" snippet, plus metadata. The filters are resolved through inverted indexes **before** the vector math. Timings are given with filters on and off.
 2. **Part 2 – a design for 10M patents** ([docs/SCALING.md](docs/SCALING.md)), plus a proof of concept of its ingest pipeline: a job queue with retries, dead-lettering, idempotent upserts and status tracking ([poc/ingest_queue.py](poc/ingest_queue.py)).
 3. **Part 3 – evaluation & training.** A reproducible pipeline that measures how well the embedding model maps a claim back to the patent that discloses it. It mines positive and hard-negative training pairs from the data, fine-tunes the model, and re-measures.
+4. **Bonus – the large dataset** (`coding_challenge_data`, 471k records / 30 GB). I ran the engine, benchmark and proof of concept on a real 25k-patent sample and made the slow parts faster, in the spirit of the "Efficiency and large data" option. See [Bonus: large dataset](#bonus-large-dataset-efficiency).
 
 ## Setup
 
@@ -22,6 +23,11 @@ pip install -r requirements.txt
 # data: unzip the provided archive so the JSON files are in data/patent_data_small/
 #   (or point elsewhere with: export PATENT_DATA_DIR=/path/to/patent_data_small)
 ```
+Optional, for the large dataset (`coding_challenge_data`, unzipped anywhere):
+```bash
+python scripts/prepare_large.py ~/Downloads/coding_challenge_data --frac 0.055   # -> data/patent_data_large_sample (25k patents, ~30 s)
+```
+
 The first run downloads `sentence-transformers/all-MiniLM-L6-v2` (~90 MB). It then encodes all
 32k passages (~60 s on an M-series Mac with MPS) and caches them in `index_cache/`. Later
 start-ups take about 4 s.
@@ -32,7 +38,11 @@ The decision is documented in [patent_search/data.py](patent_search/data.py):
 
 * A patent is **excluded only** if it has no `doc_number`, or no searchable text at all (title, abstract, claims and description all missing). In the sample data, 0 patents are excluded.
 * Any other missing field is **kept and handled separately**. A missing description or abstract simply produces no passages of that type: 119 of the 640 patents have no detailed description and stay searchable through their abstract and claims. A missing classification never matches a CPC filter, but the patent is returned when no CPC filter is set.
-* Duplicate `doc_number`s across weekly files keep the first occurrence.
+* Duplicate `doc_number`s keep the **most complete** copy (most non-empty fields; ties → first seen).
+* **Large dataset** (same policy, plus):
+  - classification `"N/A"` is treated as missing; codes are upper-cased with spaces removed, and the `/` is kept so `A61B5/097` ≠ `A61B50/97`;
+  - corrupted files are logged and skipped, and invalid records are dropped. Nothing was corrupted in practice, but the README of the data warned about it;
+  - there is no filing week in the file names, so the date filter falls back to the publication year from the doc number.
 * Claims are cleaned (`"claim 1 ,"` → `"claim 1,"`). Each claim is tagged independent or dependent, so a patent-number query uses its first independent claim.
 * The filing week is parsed from the file name (`patents_ipa240905` → 2024-09-05) and drives the date filter.
 
@@ -55,7 +65,8 @@ The decision is documented in [patent_search/data.py](patent_search/data.py):
   - **Keywords**: a token → sorted posting array index over title+abstract. Postings are intersected; phrases are verified only on the survivors.
   - **Title substring**: a character-trigram index (the pg_trgm idea). The rarest trigram is intersected first, then the substring is verified.
   - **Dates**: a vectorised range mask.
-  - **Adaptive scoring.** If the candidate set is under 15% of the corpus, only those patents' passage rows are gathered and scored, a smaller matmul. Otherwise the full contiguous matmul runs and the candidates are picked out afterwards, because gathering 45% of a big matrix costs more than multiplying all of it.
+  - **Adaptive scoring.** If the candidate set is under 10% of the corpus, only those patents' passage rows are gathered and scored, a smaller matmul. Otherwise the full contiguous matmul runs and the candidates are picked out afterwards, because gathering 45% of a big matrix costs more than multiplying all of it. The threshold was tuned on the large data (15% → 10%; see below).
+* **BM25** is a precomputed sparse matrix ([patent_search/bm25.py](patent_search/bm25.py)), so a query is a sum of a few columns. It gives the same scores as `rank_bm25` and is 178× faster per query on 25k patents.
 
 **Run it**
 
@@ -112,11 +123,28 @@ Each figure is the median of 5 runs × 8 queries, in ms of retrieval time. Query
 | cpc=B60C + kw=tread | 4,500 | 22.73 | 23.13 | 1.0x | yes |
 | title~'wheel' | 5,670 | 22.46 | 22.24 | 1.0x | yes |
 
+### Real data: large-dataset sample, 25,182 patents, 747,834 passages, mode=dense
+| filter | candidates | pre-filter ms | post-filter ms | speed-up | same top-10 |
+|---|---:|---:|---:|---:|:---:|
+| none | 25,182 | 18.01 | 18.00 | 1.0x | yes |
+| cpc=G06F (computing, ~5%) | 1,324 | 7.57 | 19.21 | 2.5x | yes |
+| cpc=H01M (batteries, ~1%) | 258 | 0.83 | 20.85 | 25.1x | yes |
+| cpc=B60 (vehicles, ~2%) | 439 | 2.29 | 19.96 | 8.7x | yes |
+| cpc=H (electricity section) | 4,112 | 17.22 | 18.80 | 1.1x | yes |
+| kw=battery | 449 | 2.41 | 38.09 | 15.8x | yes |
+| kw=wireless AND network | 241 | 0.95 | 65.46 | 68.9x | yes |
+| cpc=G06F + kw=memory | 220 | 1.02 | 23.23 | 22.7x | yes |
+| title~'vehicle' | 660 | 3.82 | 19.04 | 5.0x | yes |
+| year 2015-2017 | 3,594 | 16.65 | 18.16 | 1.1x | yes |
+
+(`python scripts/benchmark_hybrid.py --profile large --data-dir data/patent_data_large_sample --max-paras 10`; general-technology queries and filters, since this data covers every CPC section. Index load from cache: 33 s to parse the patents + 6 s to build the indexes.)
+
 **Commentary**
 
+* **On real data the filters pay off even more:** up to **69×** faster for `wireless AND network`, 25× for the battery class H01M, and 23× for `G06F + memory`. Real CPC classes and keywords are far more selective than the vehicle-only sample, and the naive post-filter gets *slower* than no filter (up to 65 ms), because it has to walk deep into the ranking to find 10 survivors.
 * **With no filter**, cost grows linearly with passages: 0.75 → 7.3 → 23 ms for 32k → 323k → 969k passages. That is one matmul. At 10M patents (~300–500M passages) exact search is ~10 s per query, so production needs ANN (HNSW / IVF-PQ). See Part 2.
 * **Selective filters make search faster, not slower.** A CPC class covering 3% of patents is 5–11× faster than the naive approach, because the matmul only touches the candidates' rows. The naive post-filter is always slightly *slower* than no filter at all: it pays for the full scoring plus a string check per scanned result, and with a selective filter it has to walk deep into the ranking to find 10 survivors.
-* **Broad filters (≥ 15% of the corpus).** Gathering rows is a memory copy that costs more than multiplying the contiguous matrix. My first version did this and was 3× *slower* than no filter at x10 scale. The engine now switches strategies at 15% selectivity: broad filters cost the same as no filter, selective ones get the speed-up. Vector DBs do the same thing (Qdrant/Weaviate switch from filtered-HNSW to exact search below a cardinality threshold).
+* **Broad filters.** Gathering rows is a memory copy that costs more than multiplying the contiguous matrix. My first version always gathered and was 3× *slower* than no filter at x10 scale. The engine now switches strategy by selectivity. I first set the threshold at 15%. On the real 25k-patent data, `year 2015-2017` (14% of patents) was still 0.8× (23.4 vs 18.8 ms; [before](results/benchmark_hybrid_large_threshold15.md)), so I lowered it to 10%, giving 1.1×. Now no filter is slower than the baseline. Vector DBs do the same thing (Qdrant/Weaviate switch from filtered-HNSW to exact search below a cardinality threshold).
 * **The benchmark also found a correctness bug.** The title filter originally used the word index, so "wheel" missed "WHEELS". I replaced it with a trigram index, which gives true substring semantics and is still indexed.
 * **What else I would do:**
   - store embeddings as float16/int8 (2–4× less memory bandwidth, and brute force is bandwidth-bound);
@@ -165,6 +193,14 @@ $ search "tire tread pattern that reduces road noise" --cpc B60C --keywords trea
   0.723 20240131866 B60C304FI    PNEUMATIC TIRE
 ```
 (The vector scoring is slow because the POC memory-maps a float16 shard file per job. The production design keeps the vectors in Qdrant.)
+
+**On the large dataset it found a real bug.** I ran it on 4 real 1,000-patent batch files (`enqueue ~/Downloads/coding_challenge_data --max-files 4`, `POC_MAX_PARAS=10`, 2 workers on the GPU):
+- A real batch takes 150–185 s to embed, longer than the 120 s lease. The lease expired while the first worker was still busy, so a second worker claimed the same job: **2 of 4 jobs were processed twice** ([log](results/poc_large_run_before_heartbeat.txt)).
+- Idempotent upserts kept the data correct (4,000 patents, no duplicates), but GPU time was wasted. On the small data each job took 3 s, so this never showed up there.
+- **Fix:**
+  - a **heartbeat** thread extends the lease every 30 s while a job runs;
+  - **fencing**: a worker may only mark a job done or failed while it still owns it, otherwise its writes are rolled back.
+- After the fix every job ran exactly once. Wall time went from 434 s to **327 s**, and throughput from 7.0 to **12.4 patents/s (+77%)** ([log](results/poc_large_run.txt)).
 
 ## Part 3 – evaluation & training (enhancement chosen)
 
@@ -215,17 +251,46 @@ Per-query: 96 queries ranked their patent higher after tuning, 34 lower. Trainin
 **Limitations / next steps**
 * "Same patent" is a weak label. A better eval set would use examiner citations: the USPTO Office Action / PatentsView citation data gives real claim → prior-art pairs.
 * The test set is small (357 queries), so differences of 1–2 points are within noise. With more time I would bootstrap confidence intervals and run several seeds.
-* Next model steps: try a stronger base (bge-base / a patent-specific model such as PaECTER), use a larger corpus (the 10^7 sample), and add a cross-encoder re-ranker on the top 100.
+* Next model steps: try a stronger base (bge-base / a patent-specific model such as PaECTER), use a larger corpus, and add a cross-encoder re-ranker on the top 100.
+* **The large dataset.** The pipeline is ready for it: similarity scores are computed in query chunks, so a 10k × 275k matrix never has to fit in memory, and hard negatives fall back to any high-ranked patent when the CPC code is missing. It has been smoke-tested on 300 large-data patents:
+  ```bash
+  python scripts/train_eval.py --data-dir data/patent_data_large_sample --max-paras 10 \
+      --max-test-patents 1000 --max-train-triplets 10000 --out models/minilm-patents-large --tag large
+  ```
+  I did **not** run it to completion. On a laptop it is about an hour (embedding 275k passages twice plus training), and it is beyond what Part 3 asks for. The reported Part 3 results are on the small dataset.
+
+## Bonus: large dataset efficiency
+
+`coding_challenge_data` has 471k records (30 GB of JSON) across every technology area. I measured each stage, then improved the slow ones:
+
+| stage | before | after | how |
+|---|---|---|---|
+| scan + clean + dedup all 471k records | 119 s (1 process) | **28 s** (10 processes, 4.3×) | [scripts/prepare_large.py](scripts/prepare_large.py): process pool; records are hash-sampled *before* parsing, so the sample is reproducible and duplicate copies always fall on the same side |
+| passages to embed for 25k patents | 3.4M (all paragraphs) | **765k** (−78%) | index abstract + claims + first 10 description paragraphs (`--max-paras 10`) |
+| embedding 748k passages | — | 31.6 min (~395 passages/s on Apple MPS) | one-off, then cached in `index_cache/` (load 0.4 s) |
+| BM25 query, 25k patents | 26.7 ms (`rank_bm25`) | **0.15 ms** (178×) | sparse-matrix BM25, identical top-10 ([results](results/bench_bm25_large.md)) |
+| dense search with a selective filter | 18–65 ms (post-filter) | **0.8–7.6 ms** (up to 69×) | index-resolved pre-filtering + adaptive threshold (table above) |
+| ingest jobs on 1,000-patent batches | 7.0 patents/s, jobs ran twice | **12.4 patents/s** | lease heartbeat + fencing (Part 2) |
+
+**What the data looks like** ([results/prepare_large_w10.json](results/prepare_large_w10.json)), which also fed into [docs/SCALING.md](docs/SCALING.md):
+- 457,385 unique patents; 2.9% of records are duplicate copies, and about 22% of the duplicated doc numbers have *differing* content;
+- **38% have no classification code**, so a CPC filter silently hides a third of the corpus;
+- 9% have no title and 1% no description;
+- 0 corrupted files;
+- about 135 passages per patent if every paragraph is indexed.
 
 ## Repository layout
 
 ```
 patent_search/data.py       loading, cleaning, missing-field policy, claim dependency parsing
 patent_search/engine.py     passage index, dense/BM25/RRF, hybrid pre-filtering
+patent_search/bm25.py       sparse-matrix BM25
 patent_search/cli.py        command-line search
 patent_search/training.py   Part 3: eval task, triplet mining, fine-tuning
 scripts/benchmark_hybrid.py Part 1 timing, with vs. without filters
 scripts/train_eval.py       Part 3 end-to-end run
+scripts/prepare_large.py    parallel scan/clean/dedup/sample of the large dataset
+scripts/bench_bm25.py       rank_bm25 vs sparse BM25
 docs/SCALING.md             Part 2 design doc
 poc/ingest_queue.py         Part 2 proof of concept
 results/                    saved eval + benchmark outputs

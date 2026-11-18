@@ -2,6 +2,9 @@
 
     python scripts/train_eval.py                     # defaults: MiniLM, 1 epoch
     python scripts/train_eval.py --epochs 2 --out models/minilm-patents
+    # large data (25k-patent sample from scripts/prepare_large.py):
+    python scripts/train_eval.py --data-dir data/patent_data_large_sample --max-paras 10 \
+        --max-test-patents 1000 --max-train-triplets 10000 --out models/minilm-patents-large --tag large
 
 Writes results/eval_results.json and prints a markdown table. The fine-tuned
 model can then be used by the search engine:  python -m patent_search.cli --model models/minilm-patents "..."
@@ -19,7 +22,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from patent_search.data import load_patents  # noqa: E402
+from patent_search.data import DEFAULT_DATA_DIR, load_patents  # noqa: E402
 from patent_search.engine import DEFAULT_MODEL, load_model  # noqa: E402
 from patent_search import training as T  # noqa: E402
 
@@ -42,23 +45,33 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--seed", type=int, default=13)
+    ap.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    ap.add_argument("--max-paras", type=int, default=None, help="description paragraphs per patent in the index")
+    ap.add_argument("--max-test-patents", type=int, default=None)
+    ap.add_argument("--max-train-triplets", type=int, default=None)
+    ap.add_argument("--tag", default="", help="suffix for results files, e.g. 'large'")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     random.seed(a.seed); np.random.seed(a.seed)
     import torch; torch.manual_seed(a.seed)
 
-    patents = load_patents()
+    patents = load_patents(a.data_dir)
     train_ids, test_ids = T.split_patents(patents, seed=a.seed)
-    corpus = T.Corpus(patents)
+    if a.max_test_patents:
+        test_ids = sorted(random.Random(a.seed).sample(test_ids, min(a.max_test_patents, len(test_ids))))
+    corpus = T.Corpus(patents, max_paras=a.max_paras)
     test_q = T.make_queries(patents, test_ids, max_dependent=2, seed=a.seed)
     train_q = T.make_queries(patents, train_ids, max_dependent=4, seed=a.seed)
+    if a.max_train_triplets and len(train_q) > a.max_train_triplets:
+        train_q = random.Random(a.seed).sample(train_q, a.max_train_triplets)
     print(f"{len(patents)} patents ({len(train_ids)} train / {len(test_ids)} test), "
           f"{len(corpus.texts)} claim-free passages, {len(train_q)} train queries, {len(test_q)} test queries")
 
     base = load_model(a.model)
     t = time.perf_counter()
     base_emb = T.encode(base, corpus.texts)
-    print(f"encoded corpus in {time.perf_counter() - t:.1f}s")
+    enc_s = time.perf_counter() - t
+    print(f"encoded corpus in {enc_s:.1f}s ({len(corpus.texts) / enc_s:.0f} passages/s)")
 
     bm25_m, _ = T.bm25_metrics(corpus, test_q)
     base_m, base_ranks = T.retrieval_metrics(base, corpus, test_q, base_emb)
@@ -81,7 +94,8 @@ def main():
     improved, worse = int((tuned_ranks < base_ranks).sum()), int((tuned_ranks > base_ranks).sum())
     lines = [
         f"Test set: {len(test_q)} claims from {len(test_ids)} held-out patents, "
-        f"searched against all {len(patents)} patents (claims removed from index).",
+        f"searched against all {len(patents):,} patents ({len(corpus.texts):,} claim-free passages"
+        f"{f', first {a.max_paras} description paragraphs per patent' if a.max_paras else ''}).",
         "", "| model | R@1 | R@10 | MRR@10 | MRR@10 indep. | MRR@10 dep. |", "|---|---:|---:|---:|---:|---:|",
         row("BM25 (reference)", bm25_m), row(f"{a.model.split('/')[-1]} (base)", base_m),
         row(f"fine-tuned ({a.epochs} ep, {len(train_trip)} triplets)", tuned_m),
@@ -92,12 +106,14 @@ def main():
     ]
     print("\n" + "\n".join(lines))
     os.makedirs("results", exist_ok=True)
-    with open("results/eval_results.json", "w") as fh:
+    suffix = f"_{a.tag}" if a.tag else ""
+    with open(f"results/eval_results{suffix}.json", "w") as fh:
         json.dump({"config": vars(a), "n_train_triplets": len(train_trip), "n_test_queries": len(test_q),
-                   "train_seconds": train_s, "bm25": bm25_m, "base": base_m, "tuned": tuned_m,
+                   "train_seconds": train_s, "corpus_passages": len(corpus.texts),
+                   "corpus_encode_seconds": enc_s, "n_patents": len(patents), "bm25": bm25_m, "base": base_m, "tuned": tuned_m,
                    "pair_base": base_p, "pair_tuned": tuned_p,
                    "per_query": {"improved": improved, "worse": worse}}, fh, indent=2)
-    with open("results/eval_results.md", "w") as fh:
+    with open(f"results/eval_results{suffix}.md", "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
 

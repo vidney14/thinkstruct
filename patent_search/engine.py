@@ -25,7 +25,8 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 
-from .data import Patent, load_patents, tokenize, DEFAULT_DATA_DIR
+from .bm25 import SparseBM25
+from .data import Patent, load_patents, normalize_cpc, tokenize, DEFAULT_DATA_DIR
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MIN_PARAGRAPH_CHARS = 40
 # above this candidate fraction, scoring the full matrix and masking is cheaper than
 # gathering the candidate rows (measured with scripts/benchmark_hybrid.py)
-GATHER_MAX_FRACTION = 0.15
+GATHER_MAX_FRACTION = 0.10
 
 
 def trigrams(s: str) -> set[str]:
@@ -85,15 +86,25 @@ class Filters:
 
 class PatentSearchEngine:
     def __init__(self, patents: list[Patent], model_name: str = DEFAULT_MODEL,
-                 cache_dir: str = "index_cache", model=None):
+                 cache_dir: str = "index_cache", model=None, max_paras: int | None = None):
+        """max_paras: index only the first N description paragraphs per patent (None = all).
+        At scale this bounds passages/patent (~130 -> ~30 with N=10) and therefore
+        embedding time and memory; claims and the abstract are always indexed."""
         self.patents = patents
+        self.max_paras = max_paras
+        self.timings: dict[str, float] = {}
         self.model_name = model_name
         self.model = model or load_model(model_name)
         self.by_id = {p.doc_number: i for i, p in enumerate(patents)}
-        self._build_passages()
-        self._build_metadata_indexes()
-        self._build_bm25()
+        for name, fn in (("passages", self._build_passages), ("metadata_indexes", self._build_metadata_indexes),
+                         ("bm25", self._build_bm25)):
+            t = time.perf_counter()
+            fn()
+            self.timings[name] = time.perf_counter() - t
+        t = time.perf_counter()
         self.emb = self._load_or_encode(cache_dir)
+        self.timings["embeddings"] = time.perf_counter() - t
+        log.info("index build timings (s): %s", {k: round(v, 2) for k, v in self.timings.items()})
 
     # ------------------------------------------------------------------ build
     def _build_passages(self):
@@ -106,7 +117,7 @@ class PatentSearchEngine:
                 texts.append(head); kinds.append("abstract"); owner.append(i)
             for j, c in enumerate(p.claims):
                 texts.append(c); kinds.append(f"claim {j + 1}"); owner.append(i)
-            for j, para in enumerate(p.description):
+            for j, para in enumerate(p.description[: self.max_paras]):
                 if len(para) >= MIN_PARAGRAPH_CHARS:
                     texts.append(para); kinds.append(f"paragraph {j + 1}"); owner.append(i)
         self.passages, self.kinds = texts, kinds
@@ -135,12 +146,10 @@ class PatentSearchEngine:
         # sorted (cpc, id) list -> prefix range lookup with bisect, O(log n + hits)
         self.cpc_sorted = sorted((p.cpc, i) for i, p in enumerate(self.patents))
         self.cpc_keys = [c for c, _ in self.cpc_sorted]
-        self.weeks = np.array([p.week.toordinal() if p.week else -1 for p in self.patents])
+        self.weeks = np.array([p.date_ordinal for p in self.patents])
 
     def _build_bm25(self):
-        from rank_bm25 import BM25Okapi
-        docs = [tokenize(f"{p.title} {p.abstract} {' '.join(p.claims)}") for p in self.patents]
-        self.bm25 = BM25Okapi(docs)
+        self.bm25 = SparseBM25([f"{p.title} {p.abstract} {' '.join(p.claims)}" for p in self.patents])
 
     def _load_or_encode(self, cache_dir: str) -> np.ndarray:
         key = hashlib.md5(json.dumps([self.model_name, len(self.passages),
@@ -173,7 +182,7 @@ class PatentSearchEngine:
         if f.cpc_prefixes:
             hits = []
             for pre in f.cpc_prefixes:
-                pre = pre.upper().replace(" ", "").replace("/", "")
+                pre = normalize_cpc(pre)
                 lo = bisect.bisect_left(self.cpc_keys, pre)
                 hi = bisect.bisect_left(self.cpc_keys, pre + "￿")
                 hits.extend(i for _, i in self.cpc_sorted[lo:hi])
@@ -214,7 +223,7 @@ class PatentSearchEngine:
 
     def _passes_naive(self, p: Patent, f: Filters) -> bool:
         """String-scan version of the same filters (used only by the post-filter baseline)."""
-        if f.cpc_prefixes and not any(p.cpc.startswith(x.upper()) for x in f.cpc_prefixes):
+        if f.cpc_prefixes and not any(p.cpc.startswith(normalize_cpc(x)) for x in f.cpc_prefixes):
             return False
         if f.keywords:
             text_toks = set(tokenize(f"{p.title} {p.abstract}"))
@@ -228,11 +237,8 @@ class PatentSearchEngine:
             if not (t == q if f.title_exact else q in t):
                 return False
         if f.date_from or f.date_to:
-            if not p.week:
-                return False
-            if f.date_from and p.week < f.date_from:
-                return False
-            if f.date_to and p.week > f.date_to:
+            d = p.date_ordinal
+            if d < 0 or (f.date_from and d < f.date_from.toordinal()) or (f.date_to and d > f.date_to.toordinal()):
                 return False
         return True
 
@@ -246,6 +252,8 @@ class PatentSearchEngine:
                filters: Filters | None = None, top_k: int = 10, mode: str = "dense",
                strategy: str = "prefilter") -> list[Result]:
         """mode: dense | bm25 | rrf (dense+bm25 reciprocal-rank fusion)
+        Note: with rrf, pre-filtering fuses ranks *within* the filtered set, while the
+        post-filter baseline fuses ranks over the whole corpus, so their orders can differ.
         strategy: prefilter (index-resolved, default) | postfilter (naive baseline)"""
         f = filters or Filters()
         exclude = None
@@ -316,15 +324,10 @@ class PatentSearchEngine:
         return ids, scores, best
 
     def _bm25(self, query, cand):
-        toks = tokenize(query)
-        if cand is None:
-            ids = np.arange(len(self.patents))
-            scores = self.bm25.get_scores(toks)
-        else:
-            ids = cand
-            scores = np.asarray(self.bm25.get_batch_scores(toks, list(cand)))
+        scores = self.bm25.scores(query, cand)
+        ids = np.arange(len(self.patents)) if cand is None else cand
         starts = self.starts[ids]  # BM25 is patent-level -> show abstract as snippet
-        return ids, np.asarray(scores), lambda k: int(starts[k])
+        return ids, scores, lambda k: int(starts[k])
 
     def _rrf(self, query, cand, k=60):
         di, ds, db = self._dense(query, cand)
@@ -341,13 +344,13 @@ class PatentSearchEngine:
             text = f"{p.title} {p.abstract}".lower()
             kws = [k for k in f.keywords if k.lower() in text]
         return Result(p.doc_number, p.title, p.classification,
-                      p.week.isoformat() if p.week else "", round(score, 4),
+                      p.week.isoformat() if p.week else str(p.year or ""), round(score, 4),
                       self.kinds[row], self.passages[row], kws)
 
 
 def build_engine(data_dir: str = DEFAULT_DATA_DIR, model: str = DEFAULT_MODEL,
-                 cache_dir: str = "index_cache") -> PatentSearchEngine:
-    return PatentSearchEngine(load_patents(data_dir), model_name=model, cache_dir=cache_dir)
+                 cache_dir: str = "index_cache", max_paras: int | None = None) -> PatentSearchEngine:
+    return PatentSearchEngine(load_patents(data_dir), model_name=model, cache_dir=cache_dir, max_paras=max_paras)
 
 
 def results_to_json(results: list[Result]) -> str:

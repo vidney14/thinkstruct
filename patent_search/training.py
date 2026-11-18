@@ -71,26 +71,27 @@ def make_queries(patents: list[Patent], ids, max_dependent: int = 2, seed: int =
 
 
 class Corpus:
-    """Claim-free passage corpus (title+abstract + description paragraphs)."""
+    """Claim-free passage corpus (title+abstract + description paragraphs).
+    max_paras caps description paragraphs per patent (needed at 25k+ patents)."""
 
-    def __init__(self, patents: list[Patent]):
+    def __init__(self, patents: list[Patent], max_paras: int | None = None):
         texts, owner = [], []
         for i, p in enumerate(patents):
             head = f"{p.title}. {p.abstract}".strip(". ")
-            paras = [x for x in p.description if len(x) >= MIN_PARA]
+            paras = [x for x in p.description[:max_paras] if len(x) >= MIN_PARA]
             for t in ([head] if head else []) + paras:
                 texts.append(t)
                 owner.append(i)
         self.texts = texts
         self.owner = np.asarray(owner)
         self.n = len(patents)
-        order_ok = np.all(np.diff(self.owner) >= 0)
-        assert order_ok
-        self.has = np.zeros(self.n, bool)
-        self.has[np.unique(self.owner)] = True
+        assert np.all(np.diff(self.owner) >= 0)
         # segment starts for reduceat over patents that have passages
         self.pids = np.unique(self.owner)
         self.starts = np.searchsorted(self.owner, self.pids)
+        # per-patent [lo, hi) passage rows (empty for patents without passages)
+        self.lo = np.searchsorted(self.owner, np.arange(self.n), side="left")
+        self.hi = np.searchsorted(self.owner, np.arange(self.n), side="right")
 
     def patent_scores(self, sims: np.ndarray) -> np.ndarray:
         """sims: (Q, P) passage similarities -> (Q, n_patents) max-pooled, -inf if no passage."""
@@ -98,35 +99,48 @@ class Corpus:
         out[:, self.pids] = np.maximum.reduceat(sims, self.starts, axis=1)
         return out
 
+    def rows(self, patent: int) -> np.ndarray:
+        return np.arange(self.lo[patent], self.hi[patent])
+
     def best_passage(self, sims_row: np.ndarray, patent: int) -> int:
-        rows = np.flatnonzero(self.owner == patent)
+        rows = self.rows(patent)
         return int(rows[np.argmax(sims_row[rows])])
 
 
 def encode(model, texts, bs=64):
     return model.encode(texts, batch_size=bs, normalize_embeddings=True,
-                        convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
+                        convert_to_numpy=True, show_progress_bar=len(texts) > 50_000).astype(np.float32)
+
+
+def iter_scores(q_emb: np.ndarray, corpus_emb: np.ndarray, corpus: Corpus, chunk: int = 256):
+    """Yield (offset, passage sims, patent scores) for query chunks, so the
+    (n_queries x n_passages) matrix never has to exist at once (10k x 275k = 11 GB)."""
+    for o in range(0, len(q_emb), chunk):
+        sims = q_emb[o:o + chunk] @ corpus_emb.T
+        yield o, sims, corpus.patent_scores(sims)
 
 
 def retrieval_metrics(model, corpus: Corpus, queries: list[Query], corpus_emb=None):
     corpus_emb = encode(model, corpus.texts) if corpus_emb is None else corpus_emb
     q_emb = encode(model, [q.text for q in queries])
-    scores = corpus.patent_scores(q_emb @ corpus_emb.T)
     gold = np.array([q.patent for q in queries])
-    gold_score = scores[np.arange(len(queries)), gold]
-    ranks = 1 + (scores > gold_score[:, None]).sum(1)  # 1 = best
+    ranks = np.empty(len(queries), dtype=np.int64)
+    for o, _, scores in iter_scores(q_emb, corpus_emb, corpus):
+        g = gold[o:o + len(scores)]
+        gold_score = scores[np.arange(len(scores)), g]
+        ranks[o:o + len(scores)] = 1 + (scores > gold_score[:, None]).sum(1)  # 1 = best
     return _summarise(ranks, queries), ranks
 
 
 def bm25_metrics(corpus: Corpus, queries: list[Query]):
-    from rank_bm25 import BM25Okapi
+    from .bm25 import SparseBM25
     docs = [[] for _ in range(corpus.n)]
     for t, o in zip(corpus.texts, corpus.owner):
-        docs[o].extend(tokenize(t))
-    bm = BM25Okapi(docs)
+        docs[o].append(t)
+    bm = SparseBM25([" ".join(d) for d in docs])
     ranks = []
     for q in queries:
-        s = bm.get_scores(tokenize(q.text))
+        s = bm.scores(q.text)
         ranks.append(1 + int((s > s[q.patent]).sum()))
     return _summarise(np.array(ranks), queries), np.array(ranks)
 
@@ -150,26 +164,26 @@ def mine_triplets(model, patents: list[Patent], corpus: Corpus, queries: list[Qu
     from rank_bm25 import BM25Okapi
     corpus_emb = encode(model, corpus.texts) if corpus_emb is None else corpus_emb
     q_emb = encode(model, [q.text for q in queries])
-    sims = q_emb @ corpus_emb.T
-    pscores = corpus.patent_scores(sims)
-    bm25_cache: dict[int, tuple] = {}
+    bm25_cache: dict[int, object] = {}
     triplets = []
-    for qi, q in enumerate(queries):
-        # positive: BM25-best passage of the same patent (independent of the model being trained)
-        rows = np.flatnonzero(corpus.owner == q.patent)
-        if len(rows) == 0:
-            continue
-        if q.patent not in bm25_cache:
-            bm25_cache[q.patent] = (rows, BM25Okapi([tokenize(corpus.texts[r]) or ["_"] for r in rows]))
-        rows, bm = bm25_cache[q.patent]
-        pos = corpus.texts[rows[int(np.argmax(bm.get_scores(tokenize(q.text))))]]
-        # hard negative: high-ranked other patent in the same CPC class, skipping the very top
-        cls = patents[q.patent].cpc[:4]
-        order = [int(j) for j in np.argsort(-pscores[qi])[: pool + 1] if j != q.patent]
-        same = [j for j in order if patents[j].cpc[:4] == cls] or order
-        neg_pid = same[min(skip_top, len(same) - 1)]
-        neg = corpus.texts[corpus.best_passage(sims[qi], neg_pid)]
-        triplets.append((q.text, pos, neg))
+    for o, sims, pscores in iter_scores(q_emb, corpus_emb, corpus):
+        for k in range(len(sims)):
+            q = queries[o + k]
+            # positive: BM25-best passage of the same patent (independent of the model being trained)
+            rows = corpus.rows(q.patent)
+            if len(rows) == 0:
+                continue
+            if q.patent not in bm25_cache:
+                bm25_cache[q.patent] = BM25Okapi([tokenize(corpus.texts[r]) or ["_"] for r in rows])
+            pos = corpus.texts[rows[int(np.argmax(bm25_cache[q.patent].get_scores(tokenize(q.text))))]]
+            # hard negative: high-ranked other patent in the same CPC class, skipping the very top.
+            # Patents without a CPC code (common in the large set) fall back to any high-ranked patent.
+            cls = patents[q.patent].cpc[:4]
+            top = np.argpartition(-pscores[k], pool + 1)[: pool + 1]
+            order = [int(j) for j in top[np.argsort(-pscores[k][top])] if j != q.patent]
+            same = [j for j in order if cls and patents[j].cpc[:4] == cls] or order
+            neg_pid = same[min(skip_top, len(same) - 1)]
+            triplets.append((q.text, pos, corpus.texts[corpus.best_passage(sims[k], neg_pid)]))
     return triplets
 
 

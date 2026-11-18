@@ -1,0 +1,21 @@
+[w0] job 1 done: 1000 patents (1000 new/changed) in 151.3s
+[w0] job 2 done: 1000 patents (1000 new/changed) in 185.9s
+[w0] job 3 done: 1000 patents (0 new/changed) in 2.6s
+[w0] queue empty, exiting
+[w1] job 2 done: 1000 patents (1000 new/changed) in 165.2s
+[w1] job 3 done: 1000 patents (1000 new/changed) in 172.9s
+[w1] job 4 done: 1000 patents (1000 new/changed) in 91.7s
+[w1] queue empty, exiting
+all workers finished in 433.7s
+jobs by status: {'done': 4}
+patents indexed: 4000   passages/vectors: 122154
+throughput: 7.0 new patents/s
+ id status   try worker  pat  new   pass  source / error
+  1 done       1 w0     1000 1000  29103  patents_batch_0001.json
+  2 done       2 w0     1000 1000  34013  patents_batch_0057.json
+  3 done       2 w0     1000    0         patents_batch_0055.json
+  4 done       1 w1     1000 1000  29456  patents_batch_0052.json
+27 candidates from SQL in 0.1 ms, vector scoring 13.9 ms
+  0.618 20130244076 H01M6/36     MOLTEN SALT AND THERMAL BATTERY
+  0.579 20220407078 H01M4/662    LITHIUM METAL BATTERIES HAVING ANODE-FREE CURRENT COLLECTORS
+  0.569 20220181711 H01M10/46    SEMICONDUCTOR DEVICE AND ELECTRONIC DEVICE

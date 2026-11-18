@@ -10,12 +10,21 @@ Same product as Part 1: query by text, claim or patent number, then semantic ran
 with hybrid filters (CPC prefix, keywords in title/abstract, title, filing date). Each
 result comes back with the claim or paragraph that matched.
 
-**Sizing assumptions** (taken from the sample data: 640 patents → 32,298 passages, about 50 per patent):
+**Sizing**, measured on the large sample (`coding_challenge_data`: 471k records, 457k unique patents across all CPC sections, 30 GB of JSON):
 
-| quantity | value |
+| measured | value |
+|---|---|
+| records → unique patents | 471,000 → 457,385 (2.9% duplicate copies; ~22% of duplicated doc numbers have *differing* content) |
+| missing classification / title / description | 38% / 9% / 1% |
+| passages per patent, all paragraphs | ~135 (19 claims + ~111 description paragraphs + abstract) |
+| passages per patent, first 10 paragraphs | ~30 (what we index; see `--max-paras`) |
+| parse + clean throughput | 471 files in 119 s serial → **28 s with 10 processes** (4.3×), ≈ 17k patents/s/machine |
+| embedding throughput, MiniLM | ~600 passages/s on an Apple M-series GPU (MPS); an A10G is ~3–5× that |
+
+| planning quantity | value |
 |---|---|
 | patents | 10M (+~7k/week new US applications; ×N if we add other offices) |
-| passages per patent | ~30 after merging short description paragraphs into ~256-token chunks |
+| passages per patent | ~30 (abstract + claims + first 10 description paragraphs). Indexing *all* paragraphs would be ~135, i.e. 4.5× the vectors, RAM and embedding cost |
 | vectors | **~300M** × 384 dims (MiniLM), or 768 if we move to a larger model |
 | raw text | ~1 MB/patent compressed XML → ~10 TB raw, ~1 TB as Parquet text |
 | query load | assume 10 QPS peak and a p95 target of < 500 ms |
@@ -97,7 +106,7 @@ A new embedding model (e.g. the Part 3 fine-tuned one) means re-embedding 300M p
 
 | item | estimate |
 |---|---|
-| Embedding 300M passages, MiniLM, ~2–3k passages/s per A10G (g5.xlarge ~$1/h, spot ~$0.4/h) | ~30–40 GPU-hours → **~$15–40** |
+| Embedding 300M passages, MiniLM, ~2–3k passages/s per A10G (g5.xlarge ~$1/h, spot ~$0.4/h). For comparison, a laptop at the measured 600/s would need ~140 h | ~30–40 GPU-hours → **~$15–40** |
 | …same with a 768-d base-size model (~4–5× slower) | ~150 GPU-h → **~$60–150** |
 | Parsing 10 TB of XML on CPU spot | **~$50** |
 
@@ -117,14 +126,17 @@ Ways to cut it: put only abstract + claims (~20/patent) in the vector index and 
 
 ## 6. Things that will be hard at scale
 
-1. **Filtered ANN.** HNSW recall collapses when a filter is very selective (graph neighbours are filtered out). This is the same thing the Part 1 benchmark shows: below about 15% selectivity it was faster to gather the candidate rows and do exact search than to scan everything. Qdrant does the same switch internally (exact search under a payload-cardinality threshold). For keyword filters we have to do it ourselves: small candidate sets go through an id filter and exact scoring.
+1. **Filtered ANN.** HNSW recall collapses when a filter is very selective (graph neighbours are filtered out). This is the same thing the Part 1 benchmark shows: below about 10% selectivity (tuned on the 25k-patent sample) it was faster to gather the candidate rows and do exact search than to scan everything. Qdrant does the same switch internally (exact search under a payload-cardinality threshold). For keyword filters we have to do it ourselves: small candidate sets go through an id filter and exact scoring.
 2. **Passage → patent aggregation** with ANN. We only see the top N passages, so a patent whose best passage ranks N+1 is lost. Over-fetch (5–10× k) and measure the effect with the eval set.
 3. **Two stores stay consistent only eventually.** The write order (vectors first, Postgres flag last) plus nightly reconciliation is our answer. Do not try to do cross-store transactions.
 4. **Re-embedding cost and time** whenever the model changes (see 3c). Version every vector with `model_version`.
 5. **Duplicates and families.** An application, its grant and its continuations are near-identical. Dedup or group by family, or the results fill up with copies of one invention.
 6. **Long documents.** Claims are written in legal language and descriptions run to hundreds of paragraphs. Chunking and the 256-token limit throw context away.
 7. **Hot spots.** Backfill writes compete with query traffic. Throttle writers or build new segments offline.
-8. **Non-English offices** (EP/CN/JP/KR) need translation or a multilingual model. That is a new model version, which means a full re-index.
+8. **Dirty data, seen in the large sample.**
+   - 38% of patents have no classification. A CPC filter therefore silently drops more than a third of the corpus, including possibly the most relevant prior art. The UI should say so, and the missing codes should be back-filled from the USPTO master classification file, or predicted with a classifier.
+   - 22% of duplicated doc numbers carry different content. The ingest has to pick a winner deterministically (we keep the most complete copy) and record which source won.
+9. **Non-English offices** (EP/CN/JP/KR) need translation or a multilingual model. That is a new model version, which means a full re-index.
 
 ## 7. Suggested order of work for the intern
 

@@ -7,6 +7,7 @@ python -m patent_search.cli "tire tread noise reduction" --cpc B60C --keywords t
 python -m patent_search.cli --patent 20240051333 -k 5            # prior-art style: patent -> similar patents
 python -m patent_search.cli --title "wheel hub" --cpc B60B          # metadata-only style lookup
 python -m patent_search.cli -i                                       # interactive REPL (model loaded once)
+python -m patent_search.cli --data-dir data/patent_data_large_sample --max-paras 10 "lithium battery cooling" --cpc H01M
 """
 from __future__ import annotations
 
@@ -39,6 +40,8 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("-i", "--interactive", action="store_true")
     ap.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     ap.add_argument("--model", default=DEFAULT_MODEL, help="HF name or path to a fine-tuned model")
+    ap.add_argument("--max-paras", type=int, default=None,
+                    help="index only the first N description paragraphs per patent (use 10 for the large data)")
     return ap
 
 
@@ -67,7 +70,7 @@ def main(argv=None) -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     ap = make_parser()
     a = ap.parse_args(argv)
-    engine = build_engine(a.data_dir, a.model)
+    engine = build_engine(a.data_dir, a.model, max_paras=a.max_paras)
     if not a.interactive:
         run_query(engine, a)
         return

@@ -6,6 +6,7 @@ stand in for the GPU embedding workers.  Fast-and-sloppy by design.
 
     python poc/ingest_queue.py reset
     python poc/ingest_queue.py enqueue data/patent_data_small        # 1 job per weekly file
+    python poc/ingest_queue.py enqueue ~/Downloads/coding_challenge_data --max-files 12   # large data: 1 job per 1000-patent batch
     python poc/ingest_queue.py work --workers 3 --fail-rate 0.3      # inject failures to see retries/DLQ
     python poc/ingest_queue.py status
     python poc/ingest_queue.py retry-failed                          # move dead-lettered jobs back to pending
@@ -14,6 +15,10 @@ stand in for the GPU embedding workers.  Fast-and-sloppy by design.
 What it demonstrates
   * atomic job claiming (UPDATE ... RETURNING) - safe with N concurrent workers
   * lease/visibility timeout: a job whose worker died is re-claimed after LEASE_S
+  * heartbeat: a live worker extends its lease every LEASE_S/4, so slow jobs are
+    NOT re-claimed (found on the large data: 1000-patent batches took 150-185 s >
+    the 120 s lease and were processed twice before this was added)
+  * fencing: a worker may only complete/fail a job it still owns (worker = me)
   * retries with max attempts, then status='failed' (dead-letter) with the error kept
   * idempotency: patents upserted by doc_number + content hash; re-running a job
     or ingesting a duplicate application is a no-op for unchanged content
@@ -72,9 +77,13 @@ def cmd_reset(_):
 
 
 def cmd_enqueue(a):
+    from patent_search.data import find_files
     c = conn()
     n = 0
-    for f in sorted(glob.glob(os.path.join(a.data_dir, "patents_ipa*.json"))):
+    files = find_files(os.path.expanduser(a.data_dir))
+    if a.max_files:  # spread across jobs/folders rather than taking the first N of job_000
+        files = files[:: max(1, len(files) // a.max_files)][: a.max_files]
+    for f in files:
         n += c.execute("INSERT OR IGNORE INTO jobs(source, enqueued) VALUES (?, ?)",
                        (os.path.abspath(f), time.time())).rowcount
     print(f"enqueued {n} new jobs")
@@ -90,7 +99,18 @@ def claim(c, worker):
            RETURNING id, source, attempts""", (worker, now + LEASE_S, now, now)).fetchone()
 
 
-def process(c, model, job_id, source, fail_rate):
+MAX_PARAS = int(os.environ["POC_MAX_PARAS"]) if os.environ.get("POC_MAX_PARAS") else None  # None = all paragraphs
+
+
+def heartbeat(job_id, worker, stop):
+    """Extend the lease while the job is being processed (own connection, own thread)."""
+    hc = conn()
+    while not stop.wait(LEASE_S / 4):
+        hc.execute("UPDATE jobs SET lease_until=? WHERE id=? AND worker=? AND status='running'",
+                   (time.time() + LEASE_S, job_id, worker))
+
+
+def process(c, model, job_id, source, fail_rate, worker):
     from patent_search.data import load_patents
     import tempfile
     # load_patents works on a directory; point it at a temp dir holding just this file
@@ -106,7 +126,7 @@ def process(c, model, job_id, source, fail_rate):
         if row and row == (h, MODEL):
             continue  # idempotent: unchanged content, same model -> skip
         start = len(texts)
-        texts += [f"{p.title}. {p.abstract}"] + p.claims + [x for x in p.description if len(x) >= 40]
+        texts += [f"{p.title}. {p.abstract}"] + p.claims + [x for x in p.description[:MAX_PARAS] if len(x) >= 40]
         todo.append((p, h, start, len(texts)))
     shard = None
     if texts:
@@ -124,8 +144,12 @@ def process(c, model, job_id, source, fail_rate):
                    h, MODEL, shard, s, e, job_id))
         c.execute("DELETE FROM patents_fts WHERE doc_number=?", (p.doc_number,))
         c.execute("INSERT INTO patents_fts VALUES (?,?,?)", (p.doc_number, p.title, p.abstract))
-    c.execute("""UPDATE jobs SET status='done', finished=?, error=NULL, n_patents=?, n_new=?, n_passages=?
-                 WHERE id=?""", (time.time(), len(patents), len(todo), len(texts), job_id))
+    done = c.execute("""UPDATE jobs SET status='done', finished=?, error=NULL, n_patents=?, n_new=?, n_passages=?
+                 WHERE id=? AND worker=? AND status='running'""",
+                     (time.time(), len(patents), len(todo), len(texts), job_id, worker)).rowcount
+    if not done:  # fencing: we lost the lease; another worker owns this job now -> discard our writes
+        c.execute("ROLLBACK")
+        raise RuntimeError("lost lease (job re-claimed by another worker); results discarded")
     c.execute("COMMIT")
     return len(patents), len(todo)
 
@@ -133,7 +157,8 @@ def process(c, model, job_id, source, fail_rate):
 def worker_main(name, fail_rate):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(MODEL, device="cpu")
+    from patent_search.engine import pick_device
+    model = SentenceTransformer(MODEL, device=os.environ.get("POC_DEVICE") or pick_device())
     c = conn()
     while True:
         job = claim(c, name)
@@ -142,15 +167,22 @@ def worker_main(name, fail_rate):
             return
         jid, src, attempts = job
         t = time.time()
+        import threading
+        stop = threading.Event()
+        hb = threading.Thread(target=heartbeat, args=(jid, name, stop), daemon=True)
+        hb.start()
         try:
-            n, new = process(c, model, jid, src, fail_rate)
+            n, new = process(c, model, jid, src, fail_rate, name)
             print(f"[{name}] job {jid} done: {n} patents ({new} new/changed) in {time.time() - t:.1f}s")
         except Exception as e:  # retry or dead-letter
             if c.in_transaction:
                 c.execute("ROLLBACK")
             status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
-            c.execute("UPDATE jobs SET status=?, error=?, worker=NULL WHERE id=?", (status, repr(e)[:300], jid))
+            c.execute("UPDATE jobs SET status=?, error=?, worker=NULL WHERE id=? AND worker=?",
+                      (status, repr(e)[:300], jid, name))
             print(f"[{name}] job {jid} attempt {attempts} FAILED -> {status}: {e}")
+        finally:
+            stop.set()
 
 
 def cmd_work(a):
@@ -208,7 +240,7 @@ def cmd_search(a):
     for doc, title, cpc, shard, s, e in rows:
         if shard not in shards:
             shards[shard] = np.load(os.path.join(SHARDS, shard), mmap_mode="r")
-        res.append((float((shards[shard][s:e].astype(np.float32) @ q).max()), doc, title, cpc))
+        res.append((float((shards[shard][s:e].astype(np.float32) @ q).max()), doc, title, cpc or "-"))
     res.sort(reverse=True)
     print(f"{len(rows)} candidates from SQL in {t_sql * 1000:.1f} ms, vector scoring {1000 * (time.perf_counter() - t):.1f} ms")
     for sc, doc, title, cpc in res[: a.k]:
@@ -219,7 +251,7 @@ def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
     sp.add_parser("reset")
-    e = sp.add_parser("enqueue"); e.add_argument("data_dir")
+    e = sp.add_parser("enqueue"); e.add_argument("data_dir"); e.add_argument("--max-files", type=int)
     w = sp.add_parser("work"); w.add_argument("--workers", type=int, default=2); w.add_argument("--fail-rate", type=float, default=0.0)
     sp.add_parser("status"); sp.add_parser("retry-failed")
     s = sp.add_parser("search"); s.add_argument("query"); s.add_argument("--cpc", nargs="+")

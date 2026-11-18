@@ -1,0 +1,15 @@
+[w0] job 1 done: 1000 patents (1000 new/changed) in 151.5s
+[w0] job 3 done: 1000 patents (1000 new/changed) in 166.7s
+[w0] queue empty, exiting
+[w1] job 2 done: 1000 patents (1000 new/changed) in 164.5s
+[w1] job 4 done: 1000 patents (1000 new/changed) in 159.0s
+[w1] queue empty, exiting
+all workers finished in 326.6s
+jobs by status: {'done': 4}
+patents indexed: 4000   passages/vectors: 122154
+throughput: 12.4 new patents/s
+ id status   try worker  pat  new   pass  source / error
+  1 done       1 w0     1000 1000  29103  patents_batch_0001.json
+  2 done       1 w1     1000 1000  34013  patents_batch_0057.json
+  3 done       1 w0     1000 1000  29582  patents_batch_0055.json
+  4 done       1 w1     1000 1000  29456  patents_batch_0052.json
