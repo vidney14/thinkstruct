@@ -1,3 +1,5 @@
+# 2-Minute Walkthrough Video: https://drive.google.com/file/d/1xdtPDXj5CAfI9_OYhWefv0ceicMdKWpW/view?usp=share_link
+
 # Patent search: hybrid semantic search, scaling plan, and embedding fine-tuning
 
 ## Problem statement
